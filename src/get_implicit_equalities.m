@@ -1,0 +1,128 @@
+function [Vbar,output] = get_implicit_equalities(prob,pars)
+% This function is an implementation of affine FR
+% Find the affine hull of the polyhedron {x: Aineq*x<=bineq, Aeq*x=beq}
+% PRIMAL max{0|Aineq*x<=bineq, Aeq*x=beq}
+% DUAL   min{bineq'y+beq'z|Aineq'y+Aeq'z=0,y>=0}
+% we will identify a dual optimal solution with the maximum number of
+% nonzeros
+
+
+% setting
+fra_time = tic;
+
+% load the parameters
+n = length(prob.vtype);
+
+% get the data matrices
+[Aineq,bineq,Aeq,beq] = FRAformat(prob);
+Aeq1 = [Aineq'; bineq'];
+Aeq2 = [Aeq'; beq'];
+
+% find the affine hull
+solvername = 'gurobi';
+[y,output] = split_gurobi(Aeq1,Aeq2);
+
+
+% if the affine hull is computed correctly
+if output.flag
+    idx = y(1:size(Aineq,1)) > 1/2;
+
+    B = [Aeq;Aineq(idx,:)];
+    d = [beq;bineq(idx,:)];
+    output.flag = true;
+    output.ymax = max(y(1:size(Aineq,1)));
+
+    output.B = B;
+    output.d = d;
+
+    %     keyboard
+
+    if strcmp(pars.var_mode,'B')
+        Z = null(full(B));
+        nb = sum(get_bvar(prob));
+        Vbar = null(Z(1:nb,:)');
+    else
+        [~,Vbar] = licols(B');
+    end
+    output.K = n - size(Vbar,2) + 1;
+
+
+    % Vbar = B';
+else
+    % if the solver can't compute the affine hull
+    output.flag = false;
+    output.ymax = -1;
+    output.B = [];
+    output.d = [];
+    Vbar = [];
+end
+
+% save the results
+output.solvername = solvername;
+output.solver_output = output;
+output.status = output.status;
+output.time = toc(fra_time); % total time
+
+end
+
+function [y,output] = split_gurobi(A,B)
+% find an element in the polyhedron
+% P = {x | A*x + B*z = 0, x>=0,z free}
+% such that x has the maximum number of non-zeros
+%
+% this is achieved by solving
+% P = max{1^{T}u | A*u + Av + B*z = 0, u,v>=0, u<=1, z free}
+% then x = u + v has the maximum number of non-zeros
+
+% find implicit equalities
+[m,n] = size(A);
+[~,n2] = size(B);
+
+% define the problem
+prob.A = sparse([A A B]);
+prob.rhs = zeros(m,1);
+prob.sense = char(ones(m,1)*'=');
+prob.lb = [zeros(2*n,1);-Inf*ones(n2,1)];
+prob.ub = [ones(n,1);Inf*ones(n+n2,1)];
+prob.obj = [ones(n,1);zeros(n+n2,1)];
+prob.modelsense = 'max';
+
+% solve the problem
+pars = [];
+pars.outputflag = 0;
+pars.TimeLimit = 60*5; % we should never spend too much time in preprocessing
+output = gurobi(prob,pars);
+
+% If the problem is infeasible, then we try to solve the problem again with
+% numericfocus = 3. This ensures that the infeasibility is not due to
+% bad models.
+if strcmp(output.status,'INFEASIBLE')
+    pars.NumericFocus = 3;
+    output = gurobi(prob,pars);
+end
+
+if (strcmp(output.status,'OPTIMAL')||strcmp(output.status,'SUBOPTIMAL'))
+    % solved normally
+    y = output.x;
+
+    % Interior-point solution.
+    % compute residual
+    output.pres = sqrt(norm(prob.A*y,2)^2 + ...
+        norm(min(y(1:2*n),0),2)^2 + ...
+        norm(max(y(1:n)-1,0),2)^2);
+    y = [y(1:n)+y(n+1:2*n); y(2*n+1:end)];
+    output.y = y;
+    % if residual is too big, then we do not consider it as reliable
+    if output.pres < 1e-5
+        output.flag = true;
+    else
+        output.flag = false;
+        output.status = 'bigres';
+    end
+else
+    y = [];
+    output.pres = -1;
+    output.flag = false;
+end
+
+end
